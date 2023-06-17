@@ -1,0 +1,76 @@
+name: Pipeline Spec Apply
+description: Builds and deploys an application according to the pipeline spec
+inputs:
+  pre-deploy-target:
+    description: make target to run before deploying
+    required: false
+  kube-env:
+    description: Environment name used in the EKS cluster name (example - nonprod for eks-cluster-nonprod)
+    required: false
+    default: "nonprod"
+  envvar-name:
+    description: Envvar name used to define the environment of the application
+    required: false
+  aws_region:
+    description: "AWS region of cluster"
+    default: "us-east-1"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: checkout code
+      uses: actions/checkout@v2
+    - name: Generate manifest
+      shell: bash
+      run: |
+        export SHORT_SHA=$(git rev-parse --short HEAD)
+        export SERVICE_NAME=$(echo "${{ github.repository }}" | sed -e "s/lonelyplanet\///g")
+        sed -e "s/GIT_COMMIT/$SHORT_SHA/g" -e "s/CLUSTER_ENV_NAME/${{inputs.kube-env}}/g" kubernetes/$SERVICE_NAME.yml > kubernetes/deploy.yml
+    - name: Set up configs
+      shell: bash
+      run: |
+        aws eks update-kubeconfig --name eks-cluster-${{inputs.kube-env}} --kubeconfig /home/runner/kubeconfig
+        sed -e "/command: aws/s?aws?$(which aws)?" -i /home/runner/kubeconfig
+    - name: Download image
+      if: inputs.pre-deploy-target != ''
+      uses: ishworkh/docker-image-artifact-download@v1
+      with:
+        image: ${{ github.repository }}
+    - name: pre-deploy
+      if: inputs.pre-deploy-target != ''
+      shell: bash
+      run: ${{inputs.envvar-name}}=${{ inputs.kube-env }} make ${{inputs.pre-deploy-target}}
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.25.0'
+
+    - name: Public IP
+      id: ip
+      uses: haythem/public-ip@v1.3
+    - name: Get Cluster IP Allow List
+      shell: bash
+      run: |
+        echo "CLUSTER_ALLOW_LIST=$(aws eks describe-cluster --name eks-cluster-${{ inputs.kube-env }} --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output text | tr -s '[:blank:]' ',')" >> $GITHUB_ENV
+    - name: Update Cluster IP Allow List
+      shell: bash
+      run: |
+        echo "UPDATED_CLUSTER_ALLOW_LIST=$(echo ${{ env.CLUSTER_ALLOW_LIST }},${{ steps.ip.outputs.ipv4 }}/32)" >> $GITHUB_ENV
+    - name: Add GitHub Actions IP to EKS Cluster
+      shell: bash
+      run: |
+        aws eks update-cluster-config --name eks-cluster-${{ inputs.kube-env }} --region=${{ inputs.aws_region }} --resources-vpc-config publicAccessCidrs=${{ env.UPDATED_CLUSTER_ALLOW_LIST }}
+    - name: Sleep for 60 seconds
+      shell: bash
+      run: sleep 60s
+
+    - name: Apply manifest
+      shell: bash
+      run: kubectl apply -f kubernetes/deploy.yml --kubeconfig /home/runner/kubeconfig
+
+    - name: Remove GitHub Actions IP to EKS Cluster
+      shell: bash
+      run: |
+        aws eks update-cluster-config --name eks-cluster-${{ inputs.kube-env }} --region=${{ inputs.aws_region }} --resources-vpc-config publicAccessCidrs=${{ env.CLUSTER_ALLOW_LIST }}
+      if: always()

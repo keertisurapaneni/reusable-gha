@@ -1,0 +1,112 @@
+name: "Wiz scan and Slack notification"
+
+inputs:
+  image:
+    description: "Docker image to use"
+    required: false
+    default: ${{ github.repository }}
+    type: string
+  slack_notify:
+    description: "Whether to notify in Slack or not"
+    default: false
+    required: false
+    type: boolean
+  slack_channel:
+    description: "Slack channel to send Wiz notifications"
+    required: false
+    type: string
+  wiz_scan_fail:
+    description: "Fail the Wiz scan if there are vulnerabilities"
+    default: true
+    required: false
+    type: boolean
+  vulnerability_policy:
+    description: "Vulnerability Wiz policy to use for scanning"
+    default: "rv-ignore-unfixed-vuln-policy"
+    required: false
+    type: string
+  WIZCLI_ID:
+    description: "Wiz CLI ID stored as an org secret"
+    required: false
+    type: string
+  WIZCLI_SECRET:
+    description: "Wiz CLI secret stored as an org secret"
+    required: false
+    type: string
+  SLACK_WEBHOOK:
+    description: "Slack webhook stored as an org secret"
+    required: false
+    type: string
+
+runs:
+  using: "composite"
+  steps:
+    - name: Scan Docker image with wizcli
+      shell: bash {0}
+      id: wiz
+      run: |
+        sudo curl -o wizcli https://wizcli.app.wiz.io/wizcli
+        sudo chmod +x wizcli
+        ./wizcli auth --id ${{ inputs.WIZCLI_ID }} --secret ${{ inputs.WIZCLI_SECRET }}
+        ./wizcli docker scan --image ${{ inputs.image }} --policy ${{ inputs.vulnerability_policy }} --policy-hits-only 2>&1 | tee wiz_results.txt
+        scan_passed=$(grep -q "Scan results: PASSED" wiz_results.txt; echo $?)
+        scan_failed=$(grep -q "Scan results: FAILED" wiz_results.txt; echo $?)
+        echo
+        if [[ $scan_failed == 0 ]]; then
+          echo "Oops..scan contains critical/high vulnerabilities."
+          echo "result=failed" >> $GITHUB_OUTPUT
+          echo
+          echo "Wiz_scan_fail input value:  ${{ inputs.wiz_scan_fail }}"
+          if ${{ inputs.wiz_scan_fail }}; then
+            echo "Exiting with exit status 1"
+            exit 1
+          else
+            exit 0
+          fi
+          echo "-------------------------------------------------------------------------------------"
+        elif [[ $scan_passed == 0 ]]; then
+          echo "Yayy..no critical/high vulnerabilities. Great job"
+          echo "result=passed" >> $GITHUB_OUTPUT
+        fi
+
+
+    - name: Upload Wiz scan results as artifact
+      if: success() || failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: wiz_results
+        path: wiz_results.txt
+      continue-on-error: true
+
+    - name: Parse Wiz results on failure
+      shell: bash
+      id: parse
+      if: ${{ inputs.slack_notify == 'true' && steps.wiz.outputs.result == 'failed' && (success() || failure()) }}
+      run: |
+        echo
+        echo "-------------------------------------------------------------------------------------"
+        echo "Parsing scan output.."
+        cat_results=$(awk '/scan analysis ready/,0' wiz_results.txt)
+        cat_results=$(sed '/LOW,/,+1d;/MEDIUM,/,+1d;/INFORMATIONAL,/,+1d' <<<"$cat_results")
+        WIZ_OUTPUT=$(echo "$cat_results" | sed '/Failed policy/d' | sed 's/SUCCESS: //')
+        echo "WIZ_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+        echo "${WIZ_OUTPUT}" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        echo
+        echo "-------------------------------------------------------------------------------------"
+        echo "Sending Slack notification.."
+
+    # Send Wiz failure notification to Slack based on user condition
+    - name: Wiz failure Slack notification
+      uses: someimportantcompany/github-actions-slack-message@v1
+      if: ${{ inputs.slack_notify == 'true' && steps.wiz.outputs.result == 'failed' && (success() || failure()) }}
+      with:
+        webhook-url: ${{ inputs.SLACK_WEBHOOK }}
+        text: |
+          ------------------------------------------------------------------------------------------------------
+              Wiz scan failed for ${{ inputs.image }} image in ${{ github.repository }} repo
+          ------------------------------------------------------------------------------------------------------
+          ${{ steps.parse.outputs.WIZ_OUTPUT }}
+        color: "#FF0000"
+        channel: ${{ inputs.slack_channel }}
+

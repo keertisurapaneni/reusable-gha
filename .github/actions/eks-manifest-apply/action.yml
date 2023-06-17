@@ -1,0 +1,92 @@
+name: EKS manifest apply
+description: Applies kubernetes manifests that do not require helm to an EKS cluster
+inputs:
+  aws-access-key-id:
+    description: 'AWS access key ID'
+    required: true
+  aws-secret-access-key:
+    description: 'AWS secret access key'
+    required: true
+  image:
+    description: 'Docker image to use'
+    required: false
+    default: ${{ github.repository }}
+  policy-arns:
+    description: 'Comma delimited list of IAM policy ARNs that include the AWS permissions needed by your application if it uses the AWS API or SDK'
+    required: false
+    type: string
+  directory:
+    description: 'Directory where the Kubernetes application lives'
+    required: false
+    default: '.'
+    type: string
+  aws-region:
+    description: 'Region of EKS cluster'
+    required: false
+    type: string
+    default: 'us-east-1'
+  namespace:
+    description: 'Namespace where Kubernetes resources should live'
+    required: false
+    type: string
+    default: 'default'
+  cluster:
+    description: 'EKS Cluster to deploy application to (must be within account + region associated with the AWS credentials)'
+    required: true
+    type: string
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: produce lp-service-id
+      shell: bash
+      id: service
+      run: echo "::set-output name=id::$(echo "${{ inputs.image }}" | sed -e "s/lonelyplanet\///g")"
+
+    - name: generate manifest
+      shell: bash
+      working-directory: ${{ inputs.directory }}
+      run: |
+        export SHORT_SHA=$(git rev-parse --short HEAD)
+        sed "s/GIT_COMMIT/$SHORT_SHA/g" kubernetes/${{ steps.service.outputs.id }}.yml > kubernetes/deploy.yml
+
+    - name: generate list of iam policy args for eksctl create iamserviceaccount
+      shell: bash
+      if: "${{ inputs.policy-arns != '' }}"
+      run: |
+        IFS=','
+        read -a strarr <<< "${{ inputs.policy-arns }}"
+        args=''
+        for p in "${strarr[@]}";
+        do
+          args="${args} --attach-policy-arn $p"
+        done
+        echo "POLICY_ARNS=$args" >> $GITHUB_ENV
+
+    - name: install dependencies
+      uses: lonelyplanet/actions/.github/actions/eks-dependencies@main
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ inputs.aws-access-key-id }}
+        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: create service account (if not exists)
+      shell: bash
+      if: "${{ inputs.policy-arns != '' }}"
+      run: eksctl -r ${{ inputs.aws-region }} create iamserviceaccount --name ${{ steps.service.outputs.id }} --namespace ${{ inputs.namespace }} --cluster ${{ inputs.cluster }} --role-name ${{ steps.service.outputs.id }}-role ${{ env.POLICY_ARNS }} --approve --override-existing-serviceaccounts
+
+    - name: apply service account to kubernetes manifest
+      shell: bash
+      if: "${{ inputs.policy-arns != '' }}"
+      working-directory: ${{ inputs.directory }}
+      run: >
+        sed -i "s/^\( *serviceAccountName:  *\)[^ ]*\(.*\)*$/\1${{ steps.service.outputs.id }}\2/" kubernetes/deploy.yml
+
+    - name: apply manifest
+      shell: bash
+      working-directory: ${{ inputs.directory }}
+      run: aws --region ${{ inputs.aws-region }} eks update-kubeconfig --name ${{ inputs.cluster }} && kubectl apply -f kubernetes/deploy.yml -n ${{ inputs.namespace }} 

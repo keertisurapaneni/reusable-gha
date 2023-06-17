@@ -1,0 +1,185 @@
+## cdk-deploy
+
+Applies a standard workflow to build, and deploy a containerized application with CDK
+
+## Inputs
+
+| Name                  | Required | Description                                                                             | Default                                                          |
+|-----------------------|----------|-----------------------------------------------------------------------------------------|------------------------------------------------------------------|
+| aws_account           | True     | AWS account number                                                                      | N/A                                                              |
+| environment           | True     | Environment to deploy to                                                                | N/A                                                              |
+| node_version          | False    | Version of node to install (required if install_node provided)                          | 12.x                                                             |
+| aws_region            | False    | AWS region of cluster                                                                   | us-east-1                                                        |
+| service               | False    | Name of the service being deployed                                                      | ${{ github.repository }}                                         |
+                                                             |
+| slack_channel         | False    | Slack channel to send Wiz failure notification to | N/A | To be used when `slack_notify` is true. |
+| wiz_scan_fail         | False    | Fail the Wiz scan if there are vulnerabilities                                         | false                                                             |
+
+## Secrets
+Note: You can just use `secrets: inherit` to inherit the below org secrets in the destination repo.
+
+| Name                       | Required | Description                                                             | Default | Notes |
+|----------------------------|----------|-------------------------------------------------------------------------|---------|----|
+| RV_LONELYPLANET_SVC_PRIVATE_SSH_KEY | False    | SSH Key for GitHub service account needed to pull any internal packages | N/A     | You can set it to org secret `${{ secrets.RV_LONELYPLANET_SVC_PRIVATE_SSH_KEY }}` in the workflow. |
+| SLACK_WEBHOOK         | False    | Slack webhook to use. | N/A | To be used when `slack_notify` is true. You can set it to org secret `${{ secrets.SLACK_WEBHOOK }}` in the workflow. |
+| WIZCLI_ID             | True     | Wiz CLI ID for service account | N/A | You can set it to org secret `${{ secrets.WIZCLI_ID }}` in the workflow. |
+| WIZCLI_SECRET         | True     | Wiz CLI secret for service account  | N/A | You can set it to org secret `${{ secrets.WIZCLI_SECRET }}` in the workflow. |
+
+
+## Simple Usage:
+```
+name: deploy
+
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    uses: lonelyplanet/actions/.github/workflows/cdk-deploy.yml@main
+    with:
+      environment: production
+      aws_account: 123456789
+```
+
+## Complex Usage:
+
+```
+name: cicd
+
+on:
+  pull_request: # build image, don't publish
+  push:
+    branches: # deploy to dev when a Dockerfile gets modified
+      - master
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+' # publish to prod
+  workflow_dispatch:
+
+jobs:
+  set-env:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.set-env.outputs.env }}
+    steps:
+      - id: set-env
+        run: |
+          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == 'true'  ]]; then
+            echo "::set-output name=env::production"
+          else
+            echo "::set-output name=env::development"
+          fi
+  ci:
+    needs: set-env
+    uses: lonelyplanet/actions/.github/workflows/ecs-deploy.yml@ecs-deploy
+    secrets: inherit
+    with:
+      environment: ${{ needs.set-env.outputs.env }}
+      deploy: ${{ github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch' }}
+      aws_account: "949364753207"
+      aws_region: "ap-southeast-2"
+      install_ruby: true
+      cluster: rv-lonelyplanet-spp-${{ needs.set-env.outputs.env }}
+      secrets_ssm_path: /lonelyplanet/my-app-${{ needs.set-env.outputs.env }}/
+      slack_channel: spp-log
+```
+
+
+## Details
+
+**Implementation**
+
+When using this workflow to deploy, a templating strategy for the task definition is recommended. This allows one task definition file to be used for all environments. However, if your application is not suitable for a templating strategy, you can simply provide the file path to the task definition you would like to deploy through the `task-definition` input.
+
+*templating strategy*
+
+To implement the templating strategy, do not provide a `task-definition` input. When that input is not provided, the workflow expects a file called `task-definition.json` to be located in the `.github/workflows/` directory. This task definition can be applied to all environments through a template strategy in conjunction with an environment variable file for the task. The environment variable file for the task must be called `.task.env` and live in the root of the project. For example, consider the following `task-definition.json` and `.task.env`:
+<table>
+<tr>
+<th>.github/workflows/task-definition.json</th>
+<th>.task.env</th>
+</tr>
+<tr>
+<td>
+<pre>
+{
+   "containerDefinitions": [
+      {
+         "command": [
+            "/bin/sh -c "npm run start"
+         ],
+         "entryPoint": [
+            "sh",
+            "-c"
+         ],
+         "essential": true,
+         "image": "$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/frontend-service-$ENVIRONMENT:$GIT_SHA",
+         "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+               "awslogs-group" : "/ecs/frontend-service-$ENVIRONMENT",
+               "awslogs-region": "$AWS_REGION",
+               "awslogs-stream-prefix": "ecs"
+            }
+         },
+         "name": "frontend-service-$ENVIRONMENT",
+         "portMappings": [
+            {
+               "containerPort": $CONTAINER_PORT,
+               "hostPort": $HOST_PORT,
+               "protocol": "tcp"
+            }
+         ]
+      }
+   ],
+   "cpu": "$CPU",
+   "executionRoleArn": "arn:aws:iam::$AWS_ACCOUNT:role/frontend-service-$ENVIRONMENT-task-role-$AWS_REGION",
+   "family": "fargate-task-definition",
+   "memory": "$MEM",
+   "networkMode": "awsvpc",
+   "runtimePlatform": {
+        "operatingSystemFamily": "LINUX"
+    },
+   "requiresCompatibilities": [
+       "FARGATE"
+    ]
+}
+</pre>
+</td>
+<td>
+
+```.task.env
+production:
+AWS_REGION=us-east-1
+CPU=512
+MEM=1024
+CONTAINER_PORT=3000
+HOST_PORT=8080
+AWS_ACCOUNT=123456789
+
+development:
+AWS_REGION=us-east-1
+CPU=256
+MEM=512
+CONTAINER_PORT=3000
+HOST_PORT=8080
+AWS_ACCOUNT=987654321
+```
+</td>
+</tr>
+</table>
+
+The workflow will consider `task-definition.json` and `.task.env` along with the required `environment` input (which must exist in `.task.env` as shown above) and fill in the templated values. Note that `$GIT_SHA` is not included in `.task.env`. This value is fetched and substituted by the workflow, so it does not need to be provided. A templating strategy may not be suitable for your application if different JSON fields are included for different environments. For example, if development has more containers than production, then your application is not a good fit for a template.
+
+*Generating the template task-definition file*
+
+The recommended strategy to generating the task definition JSON works in conjunction with the [RV ECS Task Terraform module](https://github.com/RedVentures/terraform-aws-ecs-task). This module should be created for each task/application that you would like to deploy through this workflow. On applying this module, Terraform will generate a task definition file that you can use to create the template. To access this file, after applying the terraform, navigate to the AWS Console, ECS, Task Definitions, and then click on the Task Definition defined in the Terraform module. You can then copy the JSON into `.github/workflows/task-definition.json`, and start generating the template from there. Even if you're not using a templating strategy, this is still a good way to start developing your task definition files.
+
+**prerequisites**
+
+This workflow expects an already existent ECS cluster and ECS service. The ECS service must be named `<service>-<environment>` where `service` is the workflow input `service` (which defaults to the GitHub repository name) and `environment` is the required input `environment`.
+
+**AWS Permissions**
+
+The shared workflow expects there to be an IAM role dedicated to the repository. This role leverages GitHub OIDC and can be created through the following terraform modules: [Github Actions OIDC Provider](https://github.com/RedVentures/terraform-aws-gha-oidc) and [GitHub Actions Role](https://github.com/RedVentures/terraform-aws-gha-role). The expected naming convention for this role goes as follows: `gha-<repository>` where `repository` is the name of the repository that invokes the workflow (without the owner) and `environment` is the required `environment` input. This role will need read access for the application secrets stored in SSM (if any) as well as the appropriate ECR permissions. Here is an example implementation of the above conventions: One [role defined in developement core infrastructure](https://github.com/RedVentures/tfe_rv-elsewhere/blob/main/core-infrastructure/development-account/us-east-1/gha-oidc-role.tf) and [one role defined in production core infrastructure](https://github.com/RedVentures/tfe_rv-elsewhere/blob/main/core-infrastructure/production-account/us-east-1/gha-oidc-role.tf). Note the use of the Terraform meta-argument `for_each`. This allows us to manage several roles without writing a seperate block for each one. When a new application necessitates a role, the name of that application just needs to be added to the `for_each` set, as long as the repository is in the same organization in GitHub.
+
+

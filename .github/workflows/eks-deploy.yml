@@ -1,0 +1,165 @@
+name: EKS deploy
+
+on:
+  workflow_call:
+    secrets:
+      aws-access-key-id:
+        description: 'AWS access key ID for ECR'
+        required: true
+      aws-secret-access-key:
+        description: 'AWS secret access key for ECR'
+        required: true
+    inputs:
+      cluster:
+        description: 'EKS Cluster to deploy application to (must be within account + region associated with the AWS secrets)'
+        required: true
+        type: string
+      helm:
+        description: '(Boolean) does the deployment use helm charts'
+        required: false
+        type: boolean
+        default: false
+      directory:
+        description: 'Directory where the Kubernetes application lives'
+        required: false
+        default: '.'
+        type: string
+      image:
+        description: 'Docker image to use'
+        required: false
+        default: ${{ github.repository }}
+        type: string
+      aws-region:
+        description: 'Region of EKS cluster'
+        required: false
+        type: string
+        default: 'us-east-1'
+      namespace:
+        description: 'Namespace where Kubernetes resources should live'
+        required: false
+        type: string
+        default: 'default'
+      policy-arns:
+        description: 'Comma delimited list of IAM policy ARNs that include the AWS permissions needed by your application if it uses the AWS API or SDK'
+        required: false
+        type: string
+
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v2
+
+      - name: login anvil ecr
+        uses: lonelyplanet/actions/.github/actions/login-anvil@main
+        with:
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+
+      - name: build
+        working-directory: ${{ inputs.directory }}
+        run: make build
+
+      - name: Upload image
+        uses: ishworkh/docker-image-artifact-upload@v1
+        with:
+          image: ${{ inputs.image }}
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v2
+
+      - name: Download image
+        uses: ishworkh/docker-image-artifact-download@v1
+        with:
+          image: ${{ inputs.image }}
+      
+      - name: test
+        working-directory: ${{ inputs.directory }}
+        run: make test
+
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v2
+
+      - name: Download image
+        uses: ishworkh/docker-image-artifact-download@v1
+        with:
+          image: ${{ inputs.image }}
+
+      - name: check
+        working-directory: ${{ inputs.directory }}
+        run: make check
+
+  push:
+    name: Push image
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - check
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v2
+
+      - name: Download image
+        uses: ishworkh/docker-image-artifact-download@v1
+        with:
+          image: ${{ inputs.image }}
+
+      - name: Build, tag, and push image to Amazon ECR
+        uses: lonelyplanet/actions/.github/actions/ecr-tag-and-push@main
+        with:
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+          aws-region: ${{ inputs.aws-region }}
+          image: ${{ inputs.image }}
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: push
+
+    steps:
+
+      - name: checkout code
+        uses: actions/checkout@v2
+
+      - name: Apply manifest (without helm)
+        if: ${{ !inputs.helm }}
+        uses: lonelyplanet/actions/.github/actions/eks-manifest-apply@main
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          image: ${{ inputs.image }}
+          policy-arns: ${{ inputs.policy-arns }}
+          directory: ${{ inputs.directory }}
+          namespace: ${{ inputs.namespace }}
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+          cluster: ${{ inputs.cluster }}
+
+  ######################################################################################################################################################################################
+  # This workflow is missing the logic to apply manifests produced by helm charts. A good opportunity to add this logic would be if we decide to migrate DFE2 to GitHub Actions.       #
+  # Similar to the 'eks-manifest-apply' shared action, a 'helm-chart-apply' shared action could be defined and implemented as shown below                                              #
+  #                                                                                                                                                                                    #                        
+  #    - name: Apply manifest (with helm)                                                                                                                                              #
+  #      if: ${{ inputs.helm }}                                                                                                                                                        #
+  #      uses: lonelyplanet/actions/.github/actions/eks-manifest-apply@main                                                                                               #
+  #      with:                                                                                                                                                                         #
+  #        input1: value1                                                                                                                                                              #
+  #        input2: value2                                                                                                                                                              #
+  #        inputn: valuen                                                                                                                                                              #
+  ######################################################################################################################################################################################

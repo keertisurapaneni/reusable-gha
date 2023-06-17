@@ -1,0 +1,70 @@
+name: ECR tag and push
+description: Tags a docker image and pushes to ECR
+inputs:
+  image:
+    description: 'Docker image to use'
+    required: false
+    default: ${{ github.repository }}
+  aws-region:
+    description: "AWS region for ECR"
+    required: false
+    default: 'us-east-1'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    - name: create repo if not exists
+      shell: bash
+      run: |
+        aws --region ${{ inputs.aws-region }} ecr describe-repositories --repository-names ${{ inputs.image }} > /dev/null  2>&1 || \
+          aws --region ${{ inputs.aws-region }} ecr create-repository --repository-name ${{ inputs.image }} \
+          --tags "Key"="IsProduction","Value"="true" "Key"="DataClassification","Value"="India" "Key"="ResiliencyTier","Value"="bronze"
+    - name: Set repository policy
+      shell: bash
+      run: |
+        cat > repository-policy.json <<EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowCrossAccountPull",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::444624778947:role/Karpenter-eks-cluster-nonprod-20230519203243884800000010"
+              },
+              "Action": [
+                "ecr:GetAuthorizationToken",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:GetRepositoryPolicy",
+                "ecr:DescribeRepositories",
+                "ecr:ListImages",
+                "ecr:DescribeImages",
+                "ecr:BatchGetImage",
+                "ecr:GetLifecyclePolicy",
+                "ecr:GetLifecyclePolicyPreview",
+                "ecr:ListTagsForResource",
+                "ecr:DescribeImageScanFindings"
+              ],
+              "Condition": {}
+            }
+          ]
+        }
+        EOF
+        aws ecr set-repository-policy --repository-name ${{ inputs.image }} --policy-text file://repository-policy.json
+
+
+    - name: Tag, and push image to Amazon ECR
+      shell: bash
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ inputs.image }}
+      run: |
+        export SHORT_SHA=$(git rev-parse --short HEAD)
+        docker tag ${{ inputs.image }} $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.ref_name }}
+        docker tag ${{ inputs.image }} $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.ref_name }}
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA

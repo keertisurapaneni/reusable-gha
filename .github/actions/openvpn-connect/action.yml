@@ -1,0 +1,30 @@
+name: OpenVPN Connect
+description: Establishes an OpenVPN connection to the LP VPN
+inputs:
+  openvpn-config:
+    description: "OpenVPN configuration file"
+    required: true
+  openvpn-userpass:
+    description: "OpenVPN username/password file"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up configs
+      shell: bash
+      run: |
+        printf "${{ inputs.openvpn-config }}" >> /home/runner/client.ovpn
+        printf "${{ inputs.openvpn-userpass }}" >> /home/runner/userpass.txt
+    - name: Install OpenVPN
+      shell: bash
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get -y --no-install-recommends install openvpn curl
+    - name: Connect VPN
+      shell: bash
+      run: sudo openvpn --config "/home/runner/client.ovpn" --daemon
+    - name: Wait for a VPN connection
+      shell: bash
+      run: until [ `curl -w "%{response_code}\n" -s -m 2 -o /dev/null stable.web.devnull.production.lonelyplanet.com/health-check` -eq 200 ]; do sleep 2; done
+
