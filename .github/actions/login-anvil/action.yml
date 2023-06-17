@@ -20,4 +20,4 @@ runs:
    
   - uses: aws-actions/amazon-ecr-login@v1
     with:
-      registries: '089022728777'
+      registries: '12345678901'
